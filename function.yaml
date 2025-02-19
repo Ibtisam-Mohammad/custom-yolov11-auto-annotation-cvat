@@ -1,31 +1,38 @@
 metadata:
-  name: custom-model-yolov8
+  name: custom-model-yolov11obb
   namespace: cvat
   annotations:
-    name: custom-model-yolov8
+    name: custom-model-yolov11obb
     type: detector
     framework: pytorch
     # change this accordingly to your model output/classes
     spec: |
       [
-        {"id": 0, "name": "tench"},
-        {"id": 1, "name": "goldfish"},
-        .
-        .
-        .
-        .
-        {"id": 998, "name": "ear"},
-        {"id": 999, "name": "toilet paper"}
+        {"id": 0, "name": "PET"},
+        {"id": 1, "name": "HDPE"},
+        {"id": 2, "name": "PP"},
+        {"id": 3, "name": "PS"},
+        {"id": 4, "name": "Plastic Other"},
+        {"id": 5, "name": "Aluminium"},
+        {"id": 6, "name": "Metal Other"},
+        {"id": 7, "name": "Glass White"},
+        {"id": 8, "name": "Glass Brown"},
+        {"id": 9, "name": "Glass Other"},
+        {"id": 10, "name": "Tetra Pak"},
+        {"id": 11, "name": "Paper/Carton"},
+        {"id": 12, "name": "Hazardous Waste"},
+        {"id": 13, "name": "Textiles"},
+        {"id": 14, "name": "Other"}
       ]
 spec:
-  description: custom-model-yolov8
+  description: custom-model-yolov11obb
   runtime: 'python:3.9'
   handler: main:handler
   eventTimeout: 30s
 
   build:
-    image: custom-model-yolov8
-    baseImage: ubuntu:22.04
+    image: custom-model-yolov11obb
+    baseImage: ubuntu:20.04
 
     directives:
       preCopy:
@@ -41,8 +48,15 @@ spec:
           # make sure that for the next step (at least) the ultralytics package version
           # is compatible to that of the the ultralytics package used to train the custom model
         - kind: RUN
-          value: pip3 install ultralytics==8.0.114 opencv-python==4.7.0.72 numpy==1.24.3
+          value: pip3 install ultralytics opencv-python numpy scikit-image
           #
+        # install sam code
+        - kind: RUN
+          value: pip3 install git+https://github.com/facebookresearch/segment-anything.git
+        # download sam weights
+        - kind: RUN
+          value: curl -O https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
+
         - kind: RUN
           value: ln -s /usr/bin/pip3 /usr/local/bin/pip
         - kind: RUN
