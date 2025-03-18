@@ -5,43 +5,44 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
-from skimage.measure import approximate_polygon, find_contours
-# from shared import to_cvat_mask  # if needed in your environment
-
-MASK_THRESHOLD = 0.5
 
 def init_context(context):
     context.logger.info("Init context... 0%")
     
-    # --- Load the YOLO segmentation model ---
-    # Replace "best_seg.pt" with your actual YOLO segmentation weights
-    yolo_model = YOLO("best_seg.pt")
+    # --- Load the YOLO model ---
+    yolo_model = YOLO("yolo11x.pt")
     context.user_data.yolo = yolo_model
 
-    context.logger.info("Init context... 100%")
+    context.logger.info("Init context...100%")
 
-def to_cvat_mask(mask, box):
+def iou(boxA, boxB):
     """
-    Convert a binary mask into the CVAT mask format:
-      [mask data..., xtl, ytl, xbr, ybr]
-    mask: a 2D np.uint8 array, 0 or 255
-    box: (xtl, ytl, xbr, ybr) bounding box for the mask
+    Compute IoU for axis-aligned bounding boxes:
+      box = (x1, y1, x2, y2)
     """
-    (xtl, ytl, xbr, ybr) = box
-    # Slice out the portion of 'mask' corresponding to the bounding box, flatten it, then
-    # append the bounding box corners.
-    sub_mask = mask[ytl:ybr + 1, xtl:xbr + 1]
-    flattened = sub_mask.flat[:].tolist()
-    flattened.extend([xtl, ytl, xbr, ybr])
-    return flattened
+    (xA1, yA1, xA2, yA2) = boxA
+    (xB1, yB1, xB2, yB2) = boxB
+
+    interX1 = max(xA1, xB1)
+    interY1 = max(yA1, yB1)
+    interX2 = min(xA2, xB2)
+    interY2 = min(yA2, yB2)
+    interW = max(0, interX2 - interX1 + 1)
+    interH = max(0, interY2 - interY1 + 1)
+    interArea = interW * interH
+
+    areaA = (xA2 - xA1 + 1) * (yA2 - yA1 + 1)
+    areaB = (xB2 - xB1 + 1) * (yB2 - yB1 + 1)
+
+    return interArea / float(areaA + areaB - interArea + 1e-8)
 
 def handler(context, event):
-    context.logger.info("Running YOLO segmentation inference")
+    context.logger.info("Running YOLO object detection")
     data = event.body
 
     # Optional confidence threshold (default: 0.1)
     conf_threshold = float(data.get("threshold", 0.1))
-    
+
     # Decode the image (assumed to be base64 encoded)
     image_bytes = io.BytesIO(base64.b64decode(data["image"]))
     image = cv2.imdecode(np.frombuffer(image_bytes.getvalue(), np.uint8), cv2.IMREAD_COLOR)
@@ -53,76 +54,96 @@ def handler(context, event):
             status_code=400,
         )
 
-    height, width = image.shape[:2]
-
-    # --- Run YOLO segmentation ---
-    yolo_results = context.user_data.yolo(image, retina_masks=True)
+    # --- Run YOLO to get detections ---
+    yolo_results = context.user_data.yolo(image)
     result = yolo_results[0]
 
-    # Each 'mask' in result.masks.data is a [H,W] float array with 0..1 or boolean
-    # We also have result.boxes.conf for confidence, result.boxes.cls for class, etc.
-    # Ensure these are on CPU
-    seg_masks = result.masks.data.cpu().numpy()  # shape: (N, H, W)
-    confs = result.boxes.conf.cpu().numpy().tolist()
-    clss = result.boxes.cls.cpu().numpy().tolist()
+    # Use oriented bounding boxes if available; otherwise, fallback to axis-aligned boxes
+    if hasattr(result, 'obb') and result.obb is not None:
+        result.obb.cpu()
+        polygons = result.obb.xyxy.cpu().numpy().tolist()
+        confs = result.obb.conf.cpu().numpy().tolist()
+        clss = result.obb.cls.cpu().numpy().tolist()
+    elif hasattr(result, 'boxes') and result.boxes is not None:
+        result.boxes.cpu()
+        polygons = result.boxes.xyxy.cpu().numpy().tolist()
+        confs = result.boxes.conf.cpu().numpy().tolist()
+        clss = result.boxes.cls.cpu().numpy().tolist()
+    else:
+        context.logger.error("No detection attributes found in YOLO result.")
+        return context.Response(
+            body=json.dumps({"error": "No detections found"}),
+            headers={},
+            content_type="application/json",
+            status_code=400,
+        )
+
     class_names = result.names
+    height, width = image.shape[:2]
+    all_detections = []
 
-    detections = []
-
-    # Loop over each predicted object
-    for idx in range(seg_masks.shape[0]):
-        conf = confs[idx]
+    for polygon, conf, cls in zip(polygons, confs, clss):
         if conf < conf_threshold:
             continue
 
-        cls_index = int(clss[idx])
-        label = class_names[cls_index]
+        label = class_names[int(cls)]
+        # Convert polygon or oriented box to an axis-aligned box
+        if len(polygon) > 4:
+            xs = polygon[0::2]
+            ys = polygon[1::2]
+            x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+        else:
+            x1, y1, x2, y2 = polygon
 
-        # Retrieve the mask (0..1 float). Convert to 0/255 for contour finding.
-        mask_float = seg_masks[idx]  # shape (H, W)
-        mask_uint8 = (mask_float * 255).astype(np.uint8)
+        # Clamp bounding box coordinates to the image dimensions.
+        x1 = max(0, min(x1, width - 1))
+        y1 = max(0, min(y1, height - 1))
+        x2 = max(0, min(x2, width - 1))
+        y2 = max(0, min(y2, height - 1))
 
-        # Find polygon from the mask using scikit-image find_contours
-        # find_contours => list of arrays [ (row,col), (row,col), ... ]
-        contours = find_contours(mask_float, MASK_THRESHOLD)
-        if not contours:
-            continue
-        # Just pick the largest contour
-        contour = max(contours, key=lambda c: len(c))
-        # The coordinates are in (row, col), we want (col, row)
-        contour = np.fliplr(contour)
+        # Optionally inflate the bounding box by 10%.
+        w_box = x2 - x1
+        h_box = y2 - y1
+        x1_infl = x1 - 0.05 * w_box
+        y1_infl = y1 - 0.05 * h_box
+        x2_infl = x2 + 0.05 * w_box
+        y2_infl = y2 + 0.05 * h_box
 
-        approx = approximate_polygon(contour, tolerance=2.5)
-        if len(approx) < 3:
-            continue
+        x1_infl = max(0, min(x1_infl, width - 1))
+        y1_infl = max(0, min(y1_infl, height - 1))
+        x2_infl = max(0, min(x2_infl, width - 1))
+        y2_infl = max(0, min(y2_infl, height - 1))
 
-        # We also build a bounding box for the mask for CVAT
-        xs = contour[:, 0]
-        ys = contour[:, 1]
-        x_min, x_max = np.min(xs), np.max(xs)
-        y_min, y_max = np.min(ys), np.max(ys)
-        # Round and clamp bounding box to integer coords
-        x_min = int(max(0, min(x_min, width - 1)))
-        x_max = int(max(0, min(x_max, width - 1)))
-        y_min = int(max(0, min(y_min, height - 1)))
-        y_max = int(max(0, min(y_max, height - 1)))
-
-        # Build CVAT mask from the bounding box region
-        cvat_mask = to_cvat_mask(mask_uint8, (x_min, y_min, x_max, y_max))
-
-        # Build the detection
-        detections.append({
-            "confidence": str(float(conf)),
+        # Create a detection in CVAT format with a "points" key.
+        detection = {
+            "confidence": str(conf),
             "label": label,
-            "points": approx.ravel().tolist(),  # flattened polygon
-            "mask": cvat_mask,
-            "type": "mask"
-        })
+            "type": "rectangle",
+            "points": [int(x1_infl), int(y1_infl), int(x2_infl), int(y2_infl)]
+        }
+        all_detections.append(detection)
 
-    context.logger.info(f"Detections: {detections}")
+    # ------------------------------------------------------------------
+    # Filter out duplicate detections via a simple IoU check (NMS-like)
+    # ------------------------------------------------------------------
+    iou_threshold = 0.5
+    all_detections.sort(key=lambda d: float(d["confidence"]), reverse=True)
+    final_detections = []
+    for det in all_detections:
+        boxA = (det["points"][0], det["points"][1], det["points"][2], det["points"][3])
+        keep = True
+        for kept in final_detections:
+            boxB = (kept["points"][0], kept["points"][1], kept["points"][2], kept["points"][3])
+            if iou(boxA, boxB) > iou_threshold:
+                keep = False
+                break
+        if keep:
+            final_detections.append(det)
+
+    context.logger.info(f"Detections: {final_detections}")
 
     return context.Response(
-        body=json.dumps(detections),
+        body=json.dumps(final_detections),
         headers={},
         content_type="application/json",
         status_code=200,
